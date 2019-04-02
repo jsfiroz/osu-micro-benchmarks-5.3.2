@@ -10,10 +10,15 @@
  */
 
 #include <stdio.h>
-#include <upcxx.h>
+#include <upcxx/upcxx.hpp>
+#include <upcxx/backend.hpp>
+#include <upcxx/allocate.hpp>
+#include <upcxx/reduce.hpp>
 #include <stdlib.h>
+extern "C" {
 #include <osu_common.h>
 #include <osu_coll.h>
+}
 
 using namespace std;
 using namespace upcxx;
@@ -24,110 +29,94 @@ using namespace upcxx;
 int
 main (int argc, char **argv)
 {
-    init(&argc, &argv);
+  upcxx::init(); 
+  
+  double avg_time, max_time, min_time;
+  int i = 0, size;
+  int skip;
+  int64_t t_start = 0, t_stop = 0, timer=0;
+  int max_msg_size = 1<<20, full = 0;
 
-    global_ptr<char> src;
-    global_ptr<char> dst;
-    global_ptr<double> time_src;
-    global_ptr<double> time_dst;
 
-    double avg_time, max_time, min_time;
-    int i = 0, size;
-    int skip;
-    int64_t t_start = 0, t_stop = 0, timer=0;
-    int max_msg_size = 1<<20, full = 0;
+  if (process_args(argc, argv, rank_me(), &max_msg_size, &full, HEADER)) {
+    return 0;
+  }
 
-    if (process_args(argc, argv, myrank(), &max_msg_size, &full, HEADER)) {
-        return 0;
+  std::vector<char> src((max_msg_size*sizeof(char)));
+  std::vector<char> dst((max_msg_size*sizeof(char))); 
+  double time_src;
+  double time_dst;
+
+
+  if (rank_n() < 2) {
+    if (rank_me() == 0) {
+      fprintf(stderr, "This test requires at least two processes\n");
+    }
+    return -1;
+  }
+
+  /*
+   * put a barrier for timing in upc++
+   */
+  barrier();
+
+  print_header(HEADER, rank_me(), full);
+
+  for (size=1; size <=max_msg_size; size *= 2) {
+    if (size > LARGE_MESSAGE_SIZE) {
+      skip = SKIP_LARGE;
+      iterations = iterations_large;
+    } else {
+      skip = SKIP;
     }
 
-    if (ranks() < 2) {
-        if (myrank() == 0) {
-            fprintf(stderr, "This test requires at least two processes\n");
-        }
-        return -1;
+    timer=0;
+    for (i=0; i < iterations + skip ; i++) {
+      t_start = getMicrosecondTimeStamp();
+      upcxx::reduce_one<char>(src.data(), dst.data(), size*sizeof(char),
+			      upcxx::op_fast_add, root);
+      t_stop = getMicrosecondTimeStamp();
+
+      if (i>=skip){
+	timer+=t_stop-t_start;
+      }
+      barrier();
     }
 
-    src = allocate<char> (myrank(), max_msg_size*sizeof(char));
-    dst = allocate<char> (root, max_msg_size*sizeof(char));
-
-    assert(src != NULL);
-    assert(dst != NULL);
-
-    time_src = allocate<double> (myrank(), 1);
-    time_dst = allocate<double> (root, 1);
-
-    assert(time_src != NULL);
-    assert(time_dst != NULL);
-
-    /*
-     * put a barrier since allocate is non-blocking in upc++
-     */
     barrier();
 
-    print_header(HEADER, myrank(), full);
+    double* lsrc = &time_src;
+    lsrc[0] = (1.0 * timer) / iterations;
 
-    for (size=1; size <=max_msg_size; size *= 2) {
-        if (size > LARGE_MESSAGE_SIZE) {
-            skip = SKIP_LARGE;
-            iterations = iterations_large;
-        } else {
-            skip = SKIP;
-        }
-
-        timer=0;
-        for (i=0; i < iterations + skip ; i++) {
-            t_start = getMicrosecondTimeStamp();
-            upcxx_reduce<char>((char *)src, (char *)dst, size*sizeof(char),
-                    root, UPCXX_SUM, UPCXX_CHAR);
-            t_stop = getMicrosecondTimeStamp();
-
-            if (i>=skip){
-                timer+=t_stop-t_start;
-            }
-            barrier();
-        }
-
-        barrier();
-
-        double* lsrc = (double *)time_src;
-        lsrc[0] = (1.0 * timer) / iterations;
-
-        upcxx_reduce<double>((double *)time_src, (double *)time_dst, 1, root,
-                UPCXX_MAX, UPCXX_DOUBLE);
-        if (myrank()==root) {
-            double* ldst = (double *)time_dst;
-            max_time = ldst[0];
-        }
-
-        upcxx_reduce<double>((double *)time_src, (double *)time_dst, 1, root,
-                UPCXX_MIN, UPCXX_DOUBLE);
-        if (myrank()==root) {
-            double* ldst = (double *)time_dst;
-            min_time = ldst[0];
-        }
-
-        upcxx_reduce<double>((double *)time_src, (double *)time_dst, 1, root,
-                UPCXX_SUM, UPCXX_DOUBLE);
-        if (myrank()==root) {
-            double* ldst = (double *)time_dst;
-            avg_time = ldst[0]/ranks();
-        }
-
-        barrier();
-
-        print_data(myrank(), full, size*sizeof(char), avg_time, min_time,
-                max_time, iterations);
+    upcxx::reduce_one<double>(&time_src, &time_dst, 1,
+			      upcxx::op_fast_max, root);
+    if (rank_me()==root) {
+      double* ldst = &time_dst;
+      max_time = ldst[0];
     }
 
-    deallocate(src);
-    deallocate(dst);
-    deallocate(time_src);
-    deallocate(time_dst);
+    upcxx::reduce_one<double>(&time_src, &time_dst, 1,
+			      upcxx::op_fast_min, root);
+    if (rank_me()==root) {
+      double* ldst = &time_dst;
+      min_time = ldst[0];
+    }
 
-    finalize();
+    upcxx::reduce_one<double>(&time_src, &time_dst, 1,
+			      upcxx::op_fast_add, root);
+    if (rank_me()==root) {
+      double* ldst = &time_dst;
+      avg_time = ldst[0]/rank_n();
+    }
 
-    return EXIT_SUCCESS;
+    barrier();
+
+    print_data(rank_me(), full, size*sizeof(char), avg_time, min_time,
+	       max_time, iterations);
+  }
+
+  upcxx::finalize();
+  return 0;
 }
 
 /* vi: set sw=4 sts=4 tw=80: */
